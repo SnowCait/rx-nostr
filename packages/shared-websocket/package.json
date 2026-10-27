@@ -26,10 +26,11 @@
     "access": "public"
   },
   "scripts": {
-    "build": "vite build",
+    "build": "vite build && npm run test:types",
     "lint": "eslint ./src && prettier --check ./src",
     "lint:fix": "eslint --fix ./src && prettier --write ./src",
-    "test": "vitest --run"
+    "test": "vitest --run",
+    "test:types": "tsc -p type-tests/tsconfig.node.json && tsc -p type-tests/tsconfig.browser.json && tsc -p type-tests/tsconfig.browser.json --lib ESNext --types node --skipLibCheck"
   },
   "devDependencies": {
     "rx-nostr-v3": "npm:rx-nostr@3.7.8",

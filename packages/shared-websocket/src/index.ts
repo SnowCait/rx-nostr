@@ -1,17 +1,35 @@
 /** The native, browser-style transport required by a pool. */
-export type WebSocketTransport = Pick<
-  WebSocket,
-  "readyState" | "send" | "close" | "addEventListener" | "removeEventListener"
->;
+export interface WebSocketTransport
+  extends Pick<EventTarget, "addEventListener" | "removeEventListener"> {
+  readonly readyState: number;
+  send(data: string | ArrayBufferLike | Blob | ArrayBufferView): void;
+  close(code?: number, reason?: string): void;
+}
 
 export type WebSocketTransportConstructor = new (
   url: string,
 ) => WebSocketTransport;
 
-type EventType = keyof WebSocketEventMap;
+// WebSocketEventMap and EventListenerOrEventListenerObject exist only in lib.dom.
+// EventTarget and MessageEvent are also provided by Node's web platform typings.
+type CloseNotification = Event & {
+  readonly code: number;
+  readonly reason: string;
+  readonly wasClean: boolean;
+};
+
+interface SocketEventMap {
+  open: Event;
+  message: MessageEvent;
+  error: Event;
+  close: CloseNotification;
+}
+
+type Listener = EventListener | { handleEvent(event: Event): void };
+type EventType = keyof SocketEventMap;
 type Handler<K extends EventType> = (
   this: SharedWebSocket,
-  event: WebSocketEventMap[K],
+  event: SocketEventMap[K],
 ) => unknown;
 
 interface Connection {
@@ -25,7 +43,7 @@ function closeEvent(
   code: number,
   reason: string,
   wasClean: boolean,
-): CloseEvent {
+): CloseNotification {
   // CloseEvent is not available in every runtime that provides WebSocket.
   return Object.assign(new Event("close"), { code, reason, wasClean });
 }
@@ -75,38 +93,38 @@ class PooledWebSocket extends EventTarget {
   // Typed overloads retain the familiar browser listener API.
   addEventListener<K extends EventType>(
     type: K,
-    listener: (this: SharedWebSocket, event: WebSocketEventMap[K]) => unknown,
+    listener: (this: SharedWebSocket, event: SocketEventMap[K]) => unknown,
     options?: boolean | AddEventListenerOptions,
   ): void;
   addEventListener(
     type: string,
-    listener: EventListenerOrEventListenerObject | null,
+    listener: Listener | null,
     options?: boolean | AddEventListenerOptions,
   ): void;
   addEventListener(
     type: string,
-    listener: EventListenerOrEventListenerObject | null,
+    listener: Listener | null,
     options?: boolean | AddEventListenerOptions,
   ): void {
-    super.addEventListener(type, listener, options);
+    if (listener) super.addEventListener(type, listener, options);
   }
 
   removeEventListener<K extends EventType>(
     type: K,
-    listener: (this: SharedWebSocket, event: WebSocketEventMap[K]) => unknown,
+    listener: (this: SharedWebSocket, event: SocketEventMap[K]) => unknown,
     options?: boolean | EventListenerOptions,
   ): void;
   removeEventListener(
     type: string,
-    listener: EventListenerOrEventListenerObject | null,
+    listener: Listener | null,
     options?: boolean | EventListenerOptions,
   ): void;
   removeEventListener(
     type: string,
-    listener: EventListenerOrEventListenerObject | null,
+    listener: Listener | null,
     options?: boolean | EventListenerOptions,
   ): void {
-    super.removeEventListener(type, listener, options);
+    if (listener) super.removeEventListener(type, listener, options);
   }
 
   attach(connection: Connection): void {
@@ -141,7 +159,7 @@ class PooledWebSocket extends EventTarget {
     this.pendingMessages = [];
   }
 
-  finish(event: CloseEvent): void {
+  finish(event: CloseNotification): void {
     this.dispatchEvent(event);
     this.onopen = this.onmessage = this.onerror = this.onclose = null;
   }
@@ -260,13 +278,13 @@ export class WebSocketPool {
           client.receive(
             "error",
             Object.assign(new Event("error"), {
-              cause: (event as ErrorEvent).error,
+              cause: (event as Event & { error?: unknown }).error,
             }),
           );
         }
       },
       close: (event) => {
-        const closed = event as CloseEvent;
+        const closed = event as CloseNotification;
         const remaining = [...clients];
         connection.release();
         clients.clear();

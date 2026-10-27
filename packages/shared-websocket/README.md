@@ -47,6 +47,19 @@ The integration test uses the published v3.7.8 and v4.0.0-beta.2 packages. These
 are development dependencies only. v4's runtime requirements still apply (Node.js
 24+ or equivalent browser features); this package installs no polyfills.
 
+The pool's declarations support Node.js TypeScript projects using current
+`@types/node` with `"lib": ["ESNext"]`, `"types": ["node"]`, and
+`"skipLibCheck": false`; the DOM lib is not required. The v3/v4 injection APIs
+remain structurally compatible. However, v4.0.0-beta.2 itself references the DOM
+`Worker` type in its declarations, so projects importing v4 without DOM typings
+need to address that upstream declaration or use `skipLibCheck: true`.
+
+The build checks the generated declarations in Node and browser consumer fixtures;
+`npm run test:types -w packages/shared-websocket` reruns those checks. Library
+checking stays enabled for the pool-only Node fixture and browser injection
+fixture; only the Node fixture
+that imports v4 skips library checking because of its `Worker` reference.
+
 ## Supported interface and lifecycle
 
 - `pool.WebSocket` accepts one URL argument (`string | URL`). The constructor and
