@@ -1,0 +1,43 @@
+{
+  "name": "@rx-nostr/shared-websocket",
+  "version": "0.1.0",
+  "description": "Protocol-independent WebSocket connection sharing within a pool.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/shared-websocket.cjs",
+  "module": "./dist/shared-websocket.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/shared-websocket.js",
+      "require": "./dist/shared-websocket.cjs"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/SnowCait/rx-nostr.git",
+    "directory": "packages/shared-websocket"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "vite build && npm run test:types",
+    "lint": "eslint ./src && prettier --check ./src",
+    "lint:fix": "eslint --fix ./src && prettier --write ./src",
+    "test": "vitest --run",
+    "test:types": "tsc -p type-tests/tsconfig.node.json && tsc -p type-tests/tsconfig.browser.json && tsc -p type-tests/tsconfig.browser.json --lib ESNext --types node --skipLibCheck"
+  },
+  "devDependencies": {
+    "rx-nostr-v3": "npm:rx-nostr@3.7.8",
+    "rx-nostr-v4": "npm:rx-nostr@4.0.0-beta.2",
+    "typescript": "^5.4.5",
+    "vite": "^5.3.3",
+    "vite-plugin-dts": "^4.0.0",
+    "vitest": "^1.6.0"
+  }
+}
