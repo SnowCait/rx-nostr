@@ -5,7 +5,7 @@
     "lint": "npm run lint --workspaces --if-present",
     "lint:fix": "npm run lint:fix --workspaces --if-present",
     "test": "npm run test --workspaces --if-present",
-    "build": "npm run build -w packages/rx-nostr -w packages/crypto",
+    "build": "npm run build -w packages/rx-nostr -w packages/crypto -w packages/shared-websocket",
     "docs:dev": "npm run dev -w packages/docs",
     "docs:build": "npm run build -w packages/docs"
   },

@@ -65,6 +65,7 @@ rxReq.emit({ kinds: [1] });
 
 ## For more information
 
+- [Shared WebSocket pool](./packages/shared-websocket): share physical connections across independent clients, including rx-nostr v3 and v4.
 - Documentation: https://penpenpng.github.io/rx-nostr/
 - Release notes: https://github.com/penpenpng/rx-nostr/releases
 
