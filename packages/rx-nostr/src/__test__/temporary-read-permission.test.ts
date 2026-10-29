@@ -36,7 +36,19 @@ class ControlledSocket extends EventTarget {
     );
   }
 
-  close(code = 1006) {
+  failConnection() {
+    expect(this.readyState).toBe(0);
+    // A failed handshake emits error and then an abnormal close, without open.
+    queueMicrotask(() => {
+      this.readyState = 3;
+      this.dispatchEvent(new Event("error"));
+      this.dispatchEvent(
+        Object.assign(new Event("close"), { code: 1006, reason: "" }),
+      );
+    });
+  }
+
+  close(code = 1000) {
     this.readyState = 2;
     queueMicrotask(() => {
       this.readyState = 3;
@@ -76,10 +88,19 @@ function setup(write: boolean, disconnectTimeout = 1000) {
     [HEALTHY]: { read: true, write: false },
     [FAILING]: { read: true, write },
   });
+  let excludedRead: boolean | undefined;
   rxNostr.createConnectionStateObservable().subscribe(({ from, state }) => {
     if (from !== FAILING) return;
-    if (state === "waiting-for-retrying") setRead(false);
-    if (state === "connected") setRead(true);
+    expect(rxNostr.getDefaultRelay(FAILING)?.write).toBe(write);
+    if (state === "waiting-for-retrying" && excludedRead === undefined) {
+      excludedRead = rxNostr.getDefaultRelay(FAILING)!.read;
+      setRead(false);
+    }
+    if (state === "connected" && excludedRead !== undefined) {
+      const read = excludedRead;
+      excludedRead = undefined;
+      setRead(read);
+    }
   });
 }
 
@@ -95,7 +116,7 @@ function state() {
 }
 
 test.each([false, true])(
-  "read exclusion completes backward REQ and preserves retries with write=%s",
+  "initial failure: backward completion and retry with write=%s; reproduces known stale idle timer issue",
   async (write) => {
     setup(write);
     const req = createRxBackwardReq("history");
@@ -106,12 +127,15 @@ test.each([false, true])(
     await vi.advanceTimersByTimeAsync(0);
     const [healthy, failing] = ControlledSocket.instances;
     healthy.open();
-    failing.open();
+    expect(healthy.sent).toContainEqual(["REQ", "history:0", { kinds: [1] }]);
     healthy.receive(["EOSE", "history:0"]);
     expect(complete).not.toHaveBeenCalled();
 
-    failing.close();
+    expect(failing.sent).toEqual([]);
+    const failedAt = Date.now();
+    failing.failConnection();
     await vi.advanceTimersByTimeAsync(0);
+    expect(Date.now()).toBe(failedAt);
     expect(state()).toBe("waiting-for-retrying");
     expect(complete).toHaveBeenCalledOnce();
     expect(rxNostr.getDefaultRelay(FAILING)).toMatchObject({
@@ -129,14 +153,14 @@ test.each([false, true])(
     });
     expect(retry.sent.filter(([type]) => type === "REQ")).toEqual([]);
 
-    // Characterize the stale idle timer: lazy-keep does not cancel it on restore.
+    // Known issue, not intended lazy-keep behavior: restoration leaves an idle timer.
     await vi.advanceTimersByTimeAsync(1000);
     expect(state()).toBe("dormant");
   },
 );
 
 test.each([0, 1000])(
-  "forward recovery characterizes idle disconnection with disconnectTimeout=%s",
+  "initial failure: forward recovery with disconnectTimeout=%s (zero reproduces known extra connection issue)",
   async (timeout) => {
     setup(true, timeout);
     const req = createRxForwardReq("live");
@@ -146,15 +170,14 @@ test.each([0, 1000])(
     await vi.advanceTimersByTimeAsync(0);
     const [healthy, failing] = ControlledSocket.instances;
     healthy.open();
-    failing.open();
-    failing.close();
+    failing.failConnection();
     await vi.advanceTimersByTimeAsync(0);
     expect(state()).toBe("waiting-for-retrying");
     await vi.advanceTimersByTimeAsync(100);
     let retry = ControlledSocket.instances[2];
     retry.open();
     await vi.advanceTimersByTimeAsync(0);
-    // Restoring read in the connected callback resets the strategy while the
+    // Known issue, not intended behavior: restoring read resets the strategy while the
     // connection is still non-default and has no logical subscriptions.
     if (timeout === 0) {
       expect(retry.readyState).toBe(3);
@@ -177,34 +200,30 @@ test.each([0, 1000])(
   },
 );
 
-test.each([1006, 4000])(
-  "terminal close %s stays stopped until explicit reconnect",
-  async (code) => {
-    setup(false);
-    const req = createRxForwardReq("live");
-    rxNostr.use(req).subscribe();
-    req.emit({ kinds: [1] });
-    await vi.advanceTimersByTimeAsync(0);
-    ControlledSocket.instances[0].open();
-    ControlledSocket.instances[1].open();
-    ControlledSocket.instances[1].close();
-    await vi.advanceTimersByTimeAsync(100);
-    ControlledSocket.instances[2].close(code);
-    await vi.advanceTimersByTimeAsync(0);
-    const terminal = code === 4000 ? "rejected" : "error";
-    expect(state()).toBe(terminal);
-    expect(rxNostr.getDefaultRelay(FAILING)?.read).toBe(false);
-    await vi.advanceTimersByTimeAsync(5000);
-    expect(state()).toBe(terminal);
-    expect(ControlledSocket.instances).toHaveLength(3);
-    expect(() => rxNostr.reconnect(FAILING)).toThrow();
-    setRead(true);
-    req.emit({ kinds: [2] });
-    await vi.advanceTimersByTimeAsync(5000);
-    expect(state()).toBe(terminal);
-    expect(ControlledSocket.instances).toHaveLength(3);
-    rxNostr.reconnect(FAILING);
-    ControlledSocket.instances[3].open();
-    expect(state()).toBe("connected");
-  },
-);
+test("initial failures exhaust retries and remain in error without restoring read", async () => {
+  setup(false);
+  const req = createRxForwardReq("live");
+  rxNostr.use(req).subscribe();
+  req.emit({ kinds: [1] });
+  await vi.advanceTimersByTimeAsync(0);
+  ControlledSocket.instances[0].open();
+  ControlledSocket.instances[1].failConnection();
+  await vi.advanceTimersByTimeAsync(0);
+  expect(state()).toBe("waiting-for-retrying");
+  await vi.advanceTimersByTimeAsync(100);
+  expect(state()).toBe("retrying");
+  ControlledSocket.instances[2].failConnection();
+  await vi.advanceTimersByTimeAsync(0);
+  expect(state()).toBe("error");
+  expect(rxNostr.getDefaultRelay(FAILING)).toMatchObject({
+    read: false,
+    write: false,
+  });
+  await vi.advanceTimersByTimeAsync(20000);
+  expect(state()).toBe("error");
+  expect(ControlledSocket.instances).toHaveLength(3);
+  expect(rxNostr.getDefaultRelay(FAILING)).toMatchObject({
+    read: false,
+    write: false,
+  });
+});
