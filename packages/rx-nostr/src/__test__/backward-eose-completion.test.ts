@@ -7,8 +7,6 @@ import {
   type RxNostr,
 } from "../index.js";
 
-// Use the injectable WebSocket interface so opening and failing each retry is
-// independent of timers. No network or mock-server scheduling is involved.
 class ControlledSocket extends EventTarget {
   static instances: ControlledSocket[] = [];
   readyState = 0;
@@ -76,7 +74,7 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-test("reproduces backward EOSE waiting while another previously connected relay retries", async () => {
+async function startBackwardReq() {
   const states: string[] = [];
   rxNostr.createConnectionStateObservable().subscribe(({ from, state }) => {
     if (from === RELAY_B) states.push(state);
@@ -95,14 +93,26 @@ test("reproduces backward EOSE waiting while another previously connected relay 
   expect(relayA.url).toBe(RELAY_A);
   expect(relayB.url).toBe(RELAY_B);
   relayA.open();
-  relayB.open();
   expect(rxNostr.getRelayStatus(RELAY_A)?.connection).toBe("connected");
-  expect(rxNostr.getRelayStatus(RELAY_B)?.connection).toBe("connected");
+  expect(rxNostr.getRelayStatus(RELAY_B)?.connection).toBe("connecting");
   expect(relayA.sent).toEqual([["REQ", "history:0", { kinds: [1] }]]);
-  expect(relayB.sent).toEqual([["REQ", "history:0", { kinds: [1] }]]);
+  expect(relayB.sent).toEqual([]);
+  return { relayA, relayB, states, message, complete, error, sub, startedAt };
+}
 
-  relayA.receive(["EOSE", "history:0"]);
+async function receiveEose(relay: ControlledSocket) {
+  relay.receive(["EOSE", "history:0"]);
   await vi.advanceTimersByTimeAsync(0);
+  expect(relay.sent).toContainEqual(["CLOSE", "history:0"]);
+}
+
+test("reproduces backward EOSE waiting while another previously connected relay retries", async () => {
+  const { relayA, relayB, states, message, complete, error, sub, startedAt } =
+    await startBackwardReq();
+  relayB.open();
+  expect(rxNostr.getRelayStatus(RELAY_B)?.connection).toBe("connected");
+  expect(relayB.sent).toEqual([["REQ", "history:0", { kinds: [1] }]]);
+  await receiveEose(relayA);
   expect(message).toHaveBeenCalledOnce();
   expect(message).toHaveBeenCalledWith(
     expect.objectContaining({
@@ -111,7 +121,6 @@ test("reproduces backward EOSE waiting while another previously connected relay 
       subId: "history:0",
     }),
   );
-  expect(relayA.sent).toContainEqual(["CLOSE", "history:0"]);
   expect(complete).not.toHaveBeenCalled();
   expect(sub.closed).toBe(false);
 
@@ -139,4 +148,55 @@ test("reproduces backward EOSE waiting while another previously connected relay 
   expect(complete).not.toHaveBeenCalled();
   expect(error).not.toHaveBeenCalled();
   expect(sub.closed).toBe(false);
+
+  const retry = ControlledSocket.instances[2];
+  retry.open();
+  expect(retry.sent).toContainEqual(["REQ", "history:0", { kinds: [1] }]);
+  expect(complete).not.toHaveBeenCalled();
+  await receiveEose(retry);
+  expect(Date.now() - startedAt).toBe(1000);
+  expect(complete).toHaveBeenCalledOnce();
+  expect(error).not.toHaveBeenCalled();
+  expect(sub.closed).toBe(true);
+});
+
+test("initial connection failure with polite retry completes backward REQ after healthy EOSE", async () => {
+  const { relayA, relayB, states, complete, error, sub, startedAt } =
+    await startBackwardReq();
+  relayB.dispatchEvent(new Event("error"));
+  relayB.close(1006);
+  await vi.advanceTimersByTimeAsync(0);
+  expect(rxNostr.getRelayStatus(RELAY_B)?.connection).toBe("error");
+  expect(states).toEqual(["connecting", "error"]);
+  expect(complete).not.toHaveBeenCalled();
+  await receiveEose(relayA);
+  expect(Date.now() - startedAt).toBe(0);
+  expect(complete).toHaveBeenCalledOnce();
+  expect(error).not.toHaveBeenCalled();
+  expect(sub.closed).toBe(true);
+
+  await vi.advanceTimersByTimeAsync(30000);
+  expect(states).toEqual(["connecting", "error"]);
+  expect(ControlledSocket.instances).toHaveLength(2);
+});
+
+test("initial connection stalled in connecting keeps backward REQ open until EOSE timeout", async () => {
+  const { relayA, relayB, states, complete, error, sub, startedAt } =
+    await startBackwardReq();
+  await receiveEose(relayA);
+  await vi.advanceTimersByTimeAsync(29999);
+  expect(Date.now() - startedAt).toBe(29999);
+  expect(rxNostr.getRelayStatus(RELAY_B)?.connection).toBe("connecting");
+  expect(complete).not.toHaveBeenCalled();
+  expect(sub.closed).toBe(false);
+
+  await vi.advanceTimersByTimeAsync(1);
+  expect(Date.now() - startedAt).toBe(30000);
+  expect(complete).toHaveBeenCalledOnce();
+  expect(error).not.toHaveBeenCalled();
+  expect(sub.closed).toBe(true);
+  expect(states).toEqual(["connecting"]);
+  expect(relayB.readyState).toBe(0);
+  expect(relayB.sent).toEqual([]);
+  expect(ControlledSocket.instances).toHaveLength(2);
 });
