@@ -2,12 +2,10 @@ import { afterEach, beforeEach, expect, test, vi } from "vitest";
 
 import {
   createRxBackwardReq,
-  createRxForwardReq,
   createRxNostr,
   noopVerifier,
   type RxNostr,
 } from "../index.js";
-import { faker } from "./helper.js";
 
 // Use the injectable WebSocket interface so opening and failing each retry is
 // independent of timers. No network or mock-server scheduling is involved.
@@ -36,18 +34,6 @@ class ControlledSocket extends EventTarget {
     );
   }
 
-  failConnection() {
-    expect(this.readyState).toBe(0);
-    // A failed handshake emits error and then an abnormal close, without open.
-    queueMicrotask(() => {
-      this.readyState = 3;
-      this.dispatchEvent(new Event("error"));
-      this.dispatchEvent(
-        Object.assign(new Event("close"), { code: 1006, reason: "" }),
-      );
-    });
-  }
-
   close(code = 1000) {
     this.readyState = 2;
     queueMicrotask(() => {
@@ -59,171 +45,98 @@ class ControlledSocket extends EventTarget {
   }
 }
 
-const HEALTHY = "wss://healthy.example";
-const FAILING = "wss://failing.example";
+const RELAY_A = "wss://relay-a.example";
+const RELAY_B = "wss://relay-b.example";
 let rxNostr: RxNostr;
 
 beforeEach(() => {
   vi.useFakeTimers();
+  vi.spyOn(Math, "random").mockReturnValue(0.5);
   ControlledSocket.instances = [];
-});
-
-afterEach(() => {
-  rxNostr.dispose();
-  vi.useRealTimers();
-});
-
-function setup(write: boolean, disconnectTimeout = 1000) {
   rxNostr = createRxNostr({
     verifier: noopVerifier,
     skipVerify: true,
     skipFetchNip11: true,
     websocketCtor: ControlledSocket,
     connectionStrategy: "lazy-keep",
-    retry: { strategy: "linear", interval: 100, maxCount: 1 },
-    disconnectTimeout,
-    eoseTimeout: 10000,
+    retry: {
+      strategy: "exponential",
+      maxCount: 5,
+      initialDelay: 1000,
+      polite: true,
+    },
+    eoseTimeout: 30000,
   });
-  rxNostr.setDefaultRelays({
-    [HEALTHY]: { read: true, write: false },
-    [FAILING]: { read: true, write },
-  });
-  let excludedRead: boolean | undefined;
+  rxNostr.setDefaultRelays([RELAY_A, RELAY_B]);
+});
+
+afterEach(() => {
+  rxNostr.dispose();
+  vi.restoreAllMocks();
+  vi.useRealTimers();
+});
+
+test("reproduces backward EOSE waiting while another previously connected relay retries", async () => {
+  const states: string[] = [];
   rxNostr.createConnectionStateObservable().subscribe(({ from, state }) => {
-    if (from !== FAILING) return;
-    expect(rxNostr.getDefaultRelay(FAILING)?.write).toBe(write);
-    if (state === "waiting-for-retrying" && excludedRead === undefined) {
-      excludedRead = rxNostr.getDefaultRelay(FAILING)!.read;
-      setRead(false);
-    }
-    if (state === "connected" && excludedRead !== undefined) {
-      const read = excludedRead;
-      excludedRead = undefined;
-      setRead(read);
-    }
+    if (from === RELAY_B) states.push(state);
   });
-}
-
-function setRead(read: boolean) {
-  rxNostr.setDefaultRelays({
-    ...rxNostr.getDefaultRelays(),
-    [FAILING]: { ...rxNostr.getDefaultRelay(FAILING)!, read },
-  });
-}
-
-function state() {
-  return rxNostr.getRelayStatus(FAILING)?.connection;
-}
-
-test.each([false, true])(
-  "initial failure: backward completion and retry with write=%s; reproduces known stale idle timer issue",
-  async (write) => {
-    setup(write);
-    const req = createRxBackwardReq("history");
-    const complete = vi.fn();
-    rxNostr.use(req).subscribe({ complete });
-    req.emit({ kinds: [1] });
-    req.over();
-    await vi.advanceTimersByTimeAsync(0);
-    const [healthy, failing] = ControlledSocket.instances;
-    healthy.open();
-    expect(healthy.sent).toContainEqual(["REQ", "history:0", { kinds: [1] }]);
-    healthy.receive(["EOSE", "history:0"]);
-    expect(complete).not.toHaveBeenCalled();
-
-    expect(failing.sent).toEqual([]);
-    const failedAt = Date.now();
-    failing.failConnection();
-    await vi.advanceTimersByTimeAsync(0);
-    expect(Date.now()).toBe(failedAt);
-    expect(state()).toBe("waiting-for-retrying");
-    expect(complete).toHaveBeenCalledOnce();
-    expect(rxNostr.getDefaultRelay(FAILING)).toMatchObject({
-      read: false,
-      write,
-    });
-    await vi.advanceTimersByTimeAsync(100);
-    expect(state()).toBe("retrying");
-    const retry = ControlledSocket.instances[2];
-    retry.open();
-    expect(state()).toBe("connected");
-    expect(rxNostr.getDefaultRelay(FAILING)).toMatchObject({
-      read: true,
-      write,
-    });
-    expect(retry.sent.filter(([type]) => type === "REQ")).toEqual([]);
-
-    // Known issue, not intended lazy-keep behavior: restoration leaves an idle timer.
-    await vi.advanceTimersByTimeAsync(1000);
-    expect(state()).toBe("dormant");
-  },
-);
-
-test.each([0, 1000])(
-  "initial failure: forward recovery with disconnectTimeout=%s (zero reproduces known extra connection issue)",
-  async (timeout) => {
-    setup(true, timeout);
-    const req = createRxForwardReq("live");
-    const next = vi.fn();
-    const sub = rxNostr.use(req).subscribe(next);
-    req.emit({ kinds: [1] });
-    await vi.advanceTimersByTimeAsync(0);
-    const [healthy, failing] = ControlledSocket.instances;
-    healthy.open();
-    failing.failConnection();
-    await vi.advanceTimersByTimeAsync(0);
-    expect(state()).toBe("waiting-for-retrying");
-    await vi.advanceTimersByTimeAsync(100);
-    let retry = ControlledSocket.instances[2];
-    retry.open();
-    await vi.advanceTimersByTimeAsync(0);
-    // Known issue, not intended behavior: restoring read resets the strategy while the
-    // connection is still non-default and has no logical subscriptions.
-    if (timeout === 0) {
-      expect(retry.readyState).toBe(3);
-      expect(state()).toBe("connecting");
-      retry = ControlledSocket.instances[3];
-      retry.open();
-      await vi.advanceTimersByTimeAsync(0);
-    }
-    expect(retry.sent).toContainEqual(["REQ", "live:0", { kinds: [1] }]);
-    const event = faker.event({ kind: 1 });
-    retry.receive(["EVENT", "live:0", event]);
-    await vi.advanceTimersByTimeAsync(0);
-    expect(next).toHaveBeenCalledWith(expect.objectContaining({ event }));
-    await vi.advanceTimersByTimeAsync(1000);
-    expect(state()).toBe("connected");
-    sub.unsubscribe();
-    expect(retry.sent).toContainEqual(["CLOSE", "live:0"]);
-    await vi.advanceTimersByTimeAsync(2000);
-    expect(state()).toBe("connected");
-  },
-);
-
-test("initial failures exhaust retries and remain in error without restoring read", async () => {
-  setup(false);
-  const req = createRxForwardReq("live");
-  rxNostr.use(req).subscribe();
+  const message = vi.fn();
+  rxNostr.createAllMessageObservable().subscribe(message);
+  const complete = vi.fn();
+  const error = vi.fn();
+  const req = createRxBackwardReq("history");
+  const sub = rxNostr.use(req).subscribe({ complete, error });
+  const startedAt = Date.now();
   req.emit({ kinds: [1] });
+  req.over();
   await vi.advanceTimersByTimeAsync(0);
-  ControlledSocket.instances[0].open();
-  ControlledSocket.instances[1].failConnection();
+  const [relayA, relayB] = ControlledSocket.instances;
+  expect(relayA.url).toBe(RELAY_A);
+  expect(relayB.url).toBe(RELAY_B);
+  relayA.open();
+  relayB.open();
+  expect(rxNostr.getRelayStatus(RELAY_A)?.connection).toBe("connected");
+  expect(rxNostr.getRelayStatus(RELAY_B)?.connection).toBe("connected");
+  expect(relayA.sent).toEqual([["REQ", "history:0", { kinds: [1] }]]);
+  expect(relayB.sent).toEqual([["REQ", "history:0", { kinds: [1] }]]);
+
+  relayA.receive(["EOSE", "history:0"]);
   await vi.advanceTimersByTimeAsync(0);
-  expect(state()).toBe("waiting-for-retrying");
-  await vi.advanceTimersByTimeAsync(100);
-  expect(state()).toBe("retrying");
-  ControlledSocket.instances[2].failConnection();
+  expect(message).toHaveBeenCalledOnce();
+  expect(message).toHaveBeenCalledWith(
+    expect.objectContaining({
+      from: RELAY_A,
+      type: "EOSE",
+      subId: "history:0",
+    }),
+  );
+  expect(relayA.sent).toContainEqual(["CLOSE", "history:0"]);
+  expect(complete).not.toHaveBeenCalled();
+  expect(sub.closed).toBe(false);
+
+  relayB.close(1006);
   await vi.advanceTimersByTimeAsync(0);
-  expect(state()).toBe("error");
-  expect(rxNostr.getDefaultRelay(FAILING)).toMatchObject({
-    read: false,
-    write: false,
-  });
-  await vi.advanceTimersByTimeAsync(20000);
-  expect(state()).toBe("error");
+  expect(rxNostr.getRelayStatus(RELAY_B)?.connection).toBe(
+    "waiting-for-retrying",
+  );
+  expect(complete).not.toHaveBeenCalled();
+  expect(sub.closed).toBe(false);
+  expect(Date.now() - startedAt).toBe(0);
+
+  await vi.advanceTimersByTimeAsync(1000);
+  expect(rxNostr.getRelayStatus(RELAY_B)?.connection).toBe("retrying");
+  expect(states).toEqual([
+    "connecting",
+    "connected",
+    "waiting-for-retrying",
+    "retrying",
+  ]);
   expect(ControlledSocket.instances).toHaveLength(3);
-  expect(rxNostr.getDefaultRelay(FAILING)).toMatchObject({
-    read: false,
-    write: false,
-  });
+  expect(ControlledSocket.instances[2].url).toBe(RELAY_B);
+  expect(ControlledSocket.instances[2].readyState).toBe(0);
+  expect(Date.now() - startedAt).toBe(1000);
+  expect(complete).not.toHaveBeenCalled();
+  expect(error).not.toHaveBeenCalled();
+  expect(sub.closed).toBe(false);
 });
